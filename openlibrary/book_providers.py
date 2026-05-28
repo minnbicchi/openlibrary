@@ -86,10 +86,17 @@ class Acquisition:
 
     @staticmethod
     def from_json(json: dict) -> "Acquisition":
+        # aaaa0000 - Hardened against None/invalid/non-dict inputs
+        if not isinstance(json, dict):
+            raise ValueError(f"Unknown ebook acquisition format: {json}")
         if "href" in json:
             # OPDS-style provider
             return Acquisition.from_opds_json(json)
         elif "url" in json:
+            url = json.get("url")
+            if not isinstance(url, str) or not url:
+                raise ValueError("Acquisition JSON must have a non-empty string 'url'")
+
             # We have an inconsistency in our API
             html_access: dict[str, AcquisitionAccessLiteral] = {
                 "read": "open-access",
@@ -98,27 +105,67 @@ class Acquisition:
                 "borrow": "borrow",
                 "preview": "sample",
             }
-            access = json.get("access", "open-access")
+            access = json.get("access")
+            if not isinstance(access, str):
+                access = "open-access"
             if access in html_access:
                 access = html_access[access]
+
+            if not access:
+                access = "open-access"
+
+            fmt = json.get("format")
+            if fmt not in ("web", "pdf", "epub", "audio"):
+                fmt = "web"
+
+            price = json.get("price")
+            if price is not None and not isinstance(price, str):
+                price = str(price)
+
+            provider_name = json.get("provider_name")
+            if provider_name is not None and not isinstance(provider_name, str):
+                provider_name = str(provider_name)
+
             # Pressbooks/OL-style
             return Acquisition(
-                access=access,
-                format=json.get("format", "web"),
-                price=json.get("price"),
-                url=json["url"],
-                provider_name=json.get("provider_name"),
+                access=cast(AcquisitionAccessLiteral, access),
+                format=cast(Literal["web", "pdf", "epub", "audio"], fmt),
+                price=price,
+                url=url,
+                provider_name=provider_name,
             )
         else:
             raise ValueError(f"Unknown ebook acquisition format: {json}")
 
     @staticmethod
     def from_opds_json(json: dict) -> "Acquisition":
-        if json.get("properties", {}).get("indirectAcquisition", None):
-            mimetype = json["properties"]["indirectAcquisition"][0]["type"]
-        else:
-            mimetype = json["type"]
+        # aaaa0000 - Hardened against type and value mismatches in OPDS payloads
+        if not isinstance(json, dict):
+            raise ValueError(f"OPDS JSON must be a dictionary, got: {type(json)}")
 
+        # Validate href
+        href = json.get("href")
+        if not isinstance(href, str) or not href:
+            raise ValueError("OPDS JSON must have a non-empty string 'href'")
+
+        # Determine mimetype from type or indirectAcquisition
+        mimetype = None
+        properties = json.get("properties")
+        if isinstance(properties, dict):
+            indirect = properties.get("indirectAcquisition")
+            if isinstance(indirect, list) and len(indirect) > 0:
+                first_indirect = indirect[0]
+                if isinstance(first_indirect, dict):
+                    mimetype = first_indirect.get("type")
+
+        if mimetype is None:
+            mimetype = json.get("type")
+
+        if not isinstance(mimetype, str):
+            logger.warning(f"Invalid or missing mimetype: {mimetype}")
+            mimetype = ""
+
+        # Determine format
         fmt: Literal["web", "pdf", "epub", "audio"] = "web"
         if mimetype.startswith("audio/"):
             fmt = "audio"
@@ -129,20 +176,40 @@ class Acquisition:
         elif mimetype == "text/html":
             fmt = "web"
         else:
-            logger.warning(f"Unknown mimetype: {mimetype}")
+            if mimetype:
+                logger.warning(f"Unknown mimetype: {mimetype}")
             fmt = "web"
 
-        if json.get("properties", {}).get("price", None):
-            price = f"{json['properties']['price']['value']} {json['properties']['price']['currency']}"
-        else:
-            price = None
+        # Determine price safely
+        price = None
+        if isinstance(properties, dict):
+            price_info = properties.get("price")
+            if isinstance(price_info, dict):
+                p_val = price_info.get("value")
+                p_curr = price_info.get("currency")
+                if p_val is not None and p_curr is not None:
+                    price = f"{p_val} {p_curr}"
+
+        # Validate rel
+        rel = json.get("rel")
+        if not isinstance(rel, str) or not rel:
+            raise ValueError("OPDS JSON must have a non-empty string 'rel'")
+
+        # Extract access from rel
+        access = rel.split("/")[-1]
+        if not access:
+            raise ValueError(f"Could not parse access from rel: {rel}")
+
+        provider_name = json.get("name")
+        if provider_name is not None and not isinstance(provider_name, str):
+            provider_name = str(provider_name)
 
         return Acquisition(
-            access=json["rel"].split("/")[-1],
+            access=cast(AcquisitionAccessLiteral, access),
             format=fmt,
             price=price,
-            url=json["href"],
-            provider_name=json.get("name"),
+            url=href,
+            provider_name=provider_name,
         )
 
 
@@ -263,8 +330,20 @@ class AbstractBookProvider[TProviderMetadata]:
         self,
         ed_or_solr: Edition | dict,
     ) -> list[Acquisition]:
+        # aaaa0000 - Hardened list parsing to prevent crashing pages on malformed data
         if providers := ed_or_solr.get("providers", []):
-            return [Acquisition.from_json(dict(p)) for p in providers]
+            acquisitions = []
+            for p in providers:
+                if not p:
+                    continue
+                try:
+                    p_dict = dict(p) if not isinstance(p, dict) else p
+                    acq = Acquisition.from_json(p_dict)
+                    if acq:
+                        acquisitions.append(acq)
+                except (ValueError, TypeError):
+                    logger.warning(f"Failed to parse acquisition from: {p}")
+            return acquisitions
         else:
             return []
 
@@ -570,8 +649,20 @@ class DirectProvider(AbstractBookProvider):
         Note: This will only work for solr records if the provider field was fetched
         in the solr request. (Note: this field is populated from db)
         """
+        # aaaa0000 - Hardened map/comprehension to prevent crashing on malformed data
         if providers := ed_or_solr.get("providers", []):
-            identifiers = [provider.url for provider in map(Acquisition.from_json, providers) if provider.ebook_access >= EbookAccess.PRINTDISABLED]
+            acqs = []
+            for p in providers:
+                if not p:
+                    continue
+                try:
+                    p_dict = dict(p) if not isinstance(p, dict) else p
+                    acq = Acquisition.from_json(p_dict)
+                    if acq:
+                        acqs.append(acq)
+                except (ValueError, TypeError):
+                    pass
+            identifiers = [provider.url for provider in acqs if provider.ebook_access >= EbookAccess.PRINTDISABLED]
             to_remove = set()
             for tbp in PROVIDER_ORDER:
                 # Avoid infinite recursion.
@@ -600,8 +691,22 @@ class DirectProvider(AbstractBookProvider):
         """
         Return the access level of the edition.
         """
+        # aaaa0000 - Hardened index and parse checking to avoid None/empty index crashes
         # For now assume 0 is best
-        return EbookAccess.from_acquisition_access(Acquisition.from_json(edition["providers"][0]).access)
+        providers = edition.get("providers", [])
+        if not providers:
+            return EbookAccess.NO_EBOOK
+        first_provider = providers[0]
+        if not first_provider:
+            return EbookAccess.NO_EBOOK
+        try:
+            p_dict = dict(first_provider) if not isinstance(first_provider, dict) else first_provider
+            acq = Acquisition.from_json(p_dict)
+            if acq:
+                return EbookAccess.from_acquisition_access(acq.access)
+        except (ValueError, TypeError):
+            pass
+        return EbookAccess.NO_EBOOK
 
 
 class WikisourceProvider(AbstractBookProvider):
