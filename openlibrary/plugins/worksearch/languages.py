@@ -1,6 +1,7 @@
 """Language pages"""
 
 import logging
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal, override
 
@@ -33,7 +34,19 @@ async def get_top_languages(
         )
         for (lang_key, count) in await get_all_language_counts("work")
     ]
-    results.sort(key=lambda x: x[sort].casefold() if sort == "name" else x[sort], reverse=sort in ("count", "ebook_edition_count"))
+    if sort == "name":
+        results.sort(
+            key=lambda x: (
+                "".join(
+                    c
+                    for c in unicodedata.normalize('NFD', x.name.casefold())
+                    if not unicodedata.category(c).startswith('M')
+                ),
+                unicodedata.normalize('NFD', x.name.casefold()),
+            )
+        )
+    else:
+        results.sort(key=lambda x: x[sort], reverse=sort in ("count", "ebook_edition_count"))
     return results[:limit]
 
 
